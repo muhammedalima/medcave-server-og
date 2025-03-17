@@ -409,6 +409,26 @@ cron.schedule('*/5 * * * *', async () => {
   await expandRadiusIfNeeded();
 });
 
+const authenticateJWT = async (req, res, next) => {
+  try {
+    const authHeader = req.headers.authorization;
+    
+    if (!authHeader || !authHeader.startsWith('Bearer ')) {
+      return res.status(401).json({ error: 'Unauthorized: No token provided' });
+    }
+    
+    const token = authHeader.split(' ')[1];
+    
+    // Verify the Firebase ID token
+    const decodedToken = await admin.auth().verifyIdToken(token);
+    req.user = decodedToken;
+    next();
+  } catch (error) {
+    console.error('Error verifying token:', error);
+    return res.status(403).json({ error: 'Forbidden: Invalid token' });
+  }
+};
+
 app.post('/api/update-fcm-token', authenticateJWT, async (req, res) => {
   try {
     const { fcmToken } = req.body;
@@ -627,27 +647,6 @@ app.post('/api/config/deep-link', async (req, res) => {
     return res.status(500).json({ error: 'Internal server error' });
   }
 });
-
-// Add Firebase Auth middleware for protected routes
-const authenticateJWT = async (req, res, next) => {
-  try {
-    const authHeader = req.headers.authorization;
-    
-    if (!authHeader || !authHeader.startsWith('Bearer ')) {
-      return res.status(401).json({ error: 'Unauthorized: No token provided' });
-    }
-    
-    const token = authHeader.split(' ')[1];
-    
-    // Verify the Firebase ID token
-    const decodedToken = await admin.auth().verifyIdToken(token);
-    req.user = decodedToken;
-    next();
-  } catch (error) {
-    console.error('Error verifying token:', error);
-    return res.status(403).json({ error: 'Forbidden: Invalid token' });
-  }
-};
 
 // Apply authentication middleware to protected routes
 app.post('/api/notify-drivers', authenticateJWT);
