@@ -139,7 +139,6 @@ async function handleNewAmbulanceRequest(requestId, emergencyData, locationData)
   }
 }
 
-// Notify drivers within a specific radius
 async function notifyDriversInRadius(requestId, latitude, longitude, radiusKm) {
   try {
     console.log(`Finding drivers within ${radiusKm}km of location: ${latitude}, ${longitude}`);
@@ -196,7 +195,8 @@ async function notifyDriversInRadius(requestId, latitude, longitude, radiusKm) {
         eligibleDrivers.push({
           driverId,
           distance: Math.round(distance * 10) / 10, // Round to 1 decimal place
-          fcmToken: driverData.fcmToken
+          fcmToken: driverData.fcmToken,
+          driverRef: doc.ref // Store reference to driver document for token updates
         });
       }
     });
@@ -213,6 +213,7 @@ async function notifyDriversInRadius(requestId, latitude, longitude, radiusKm) {
     const requestData = requestDoc.data();
     
     // Send notifications to eligible drivers
+    const invalidTokens = []; // Track invalid tokens to remove them
     const notificationPromises = eligibleDrivers.map(async (driver) => {
       // Check if driver has a valid FCM token
       if (!driver.fcmToken) {
@@ -260,6 +261,18 @@ async function notifyDriversInRadius(requestId, latitude, longitude, radiusKm) {
         return driver.driverId;
       } catch (error) {
         console.error(`Error sending notification to driver ${driver.driverId}:`, error);
+        
+        // Check if token is invalid and mark for removal
+        if (error.code === 'messaging/registration-token-not-registered' || 
+            error.code === 'messaging/invalid-registration-token' ||
+            error.code === 'messaging/invalid-argument') {
+          console.log(`Invalid FCM token detected for driver ${driver.driverId}. Marking for removal.`);
+          invalidTokens.push({
+            driverId: driver.driverId,
+            driverRef: driver.driverRef
+          });
+        }
+        
         return null;
       }
     });
@@ -268,18 +281,40 @@ async function notifyDriversInRadius(requestId, latitude, longitude, radiusKm) {
     const notifiedDriverIds = (await Promise.all(notificationPromises))
       .filter(id => id !== null); // Filter out null values
     
+    // Process any invalid tokens that were detected
+    if (invalidTokens.length > 0) {
+      const tokenCleanupPromises = invalidTokens.map(async ({driverRef}) => {
+        try {
+          // Update the driver document to clear the invalid token
+          await driverRef.update({
+            fcmToken: admin.firestore.FieldValue.delete(),
+            tokenInvalidatedAt: admin.firestore.FieldValue.serverTimestamp(),
+            isTokenValid: false
+          });
+        } catch (error) {
+          console.error(`Error removing invalid token:`, error);
+        }
+      });
+      
+      // Wait for all token cleanup operations to complete
+      await Promise.all(tokenCleanupPromises);
+      console.log(`Cleaned up ${invalidTokens.length} invalid FCM tokens`);
+    }
+    
     if (notifiedDriverIds.length > 0) {
       // Update the notification state with newly notified drivers
       await db.collection('requestNotifications').doc(requestId).update({
         driversNotified: admin.firestore.FieldValue.arrayUnion(...notifiedDriverIds),
         updatedAt: admin.firestore.FieldValue.serverTimestamp(),
-        lastNotificationRadius: radiusKm
+        lastNotificationRadius: radiusKm,
+        invalidTokensDetected: invalidTokens.length > 0
       });
     } else {
       // Just update the timestamp and radius without modifying the drivers array
       await db.collection('requestNotifications').doc(requestId).update({
         updatedAt: admin.firestore.FieldValue.serverTimestamp(),
-        lastNotificationRadius: radiusKm
+        lastNotificationRadius: radiusKm,
+        invalidTokensDetected: invalidTokens.length > 0
       });
       console.log(`No drivers were successfully notified for request ${requestId}`);
     }
@@ -374,41 +409,25 @@ cron.schedule('*/5 * * * *', async () => {
   await expandRadiusIfNeeded();
 });
 
-// Endpoint to trigger manual notification
-app.post('/api/notify-drivers', async (req, res) => {
+app.post('/api/update-fcm-token', authenticateJWT, async (req, res) => {
   try {
-    const { requestId } = req.body;
+    const { fcmToken } = req.body;
+    const userId = req.user.uid;
     
-    if (!requestId) {
-      return res.status(400).json({ error: 'Request ID is required' });
+    if (!fcmToken) {
+      return res.status(400).json({ error: 'FCM token is required' });
     }
     
-    // Get request details
-    const requestDoc = await db.collection('ambulanceRequests').doc(requestId).get();
-    if (!requestDoc.exists) {
-      return res.status(404).json({ error: 'Ambulance request not found' });
-    }
+    // Update the token in Firestore
+    await db.collection('drivers').doc(userId).update({
+      fcmToken: fcmToken,
+      tokenUpdatedAt: admin.firestore.FieldValue.serverTimestamp(),
+      isTokenValid: true
+    });
     
-    const requestData = requestDoc.data();
-    
-    // Check if request is already accepted
-    if (requestData.status !== 'pending') {
-      return res.status(400).json({ 
-        error: 'Request is not in pending state',
-        status: requestData.status
-      });
-    }
-    
-    // Process the notification
-    await handleNewAmbulanceRequest(
-      requestId,
-      requestData.emergency,
-      requestData.location
-    );
-    
-    return res.json({ success: true, message: 'Notification process started' });
+    return res.json({ success: true, message: 'FCM token updated successfully' });
   } catch (error) {
-    console.error('Error in notify-drivers endpoint:', error);
+    console.error('Error updating FCM token:', error);
     return res.status(500).json({ error: 'Internal server error' });
   }
 });
