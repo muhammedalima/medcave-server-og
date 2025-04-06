@@ -201,7 +201,7 @@ async function notifyDriversInRadius(requestId, latitude, longitude, radiusKm) {
     const notificationPromises = eligibleDrivers.map(async (driver) => {
       if (!driver.fcmToken) {
         console.log(`Driver ${driver.driverId} has no FCM token`);
-        return null;
+        return { driverId: null, invalidToken: false };
       }
       
       const message = {
@@ -239,15 +239,44 @@ async function notifyDriversInRadius(requestId, latitude, longitude, radiusKm) {
       try {
         await admin.messaging().send(message);
         console.log(`Notification sent to driver ${driver.driverId}`);
-        return driver.driverId;
+        return { driverId: driver.driverId, invalidToken: false };
       } catch (error) {
-        console.error(`Error sending notification to driver ${driver.driverId}:`, error);
-        return null;
+        if (error.code === 'messaging/registration-token-not-registered') {
+          console.log(`Invalid FCM token for driver ${driver.driverId}, marking for removal`);
+          // Mark the token as invalid but don't stop processing other notifications
+          return { driverId: null, invalidToken: true, invalidDriverId: driver.driverId };
+        } else {
+          console.error(`Error sending notification to driver ${driver.driverId}:`, error);
+          return { driverId: null, invalidToken: false };
+        }
       }
     });
     
-    const notifiedDriverIds = (await Promise.all(notificationPromises))
-      .filter(id => id !== null);
+    const results = await Promise.all(notificationPromises);
+    
+    // Process invalid tokens
+    const invalidDriverIds = results
+      .filter(result => result.invalidToken)
+      .map(result => result.invalidDriverId);
+    
+    if (invalidDriverIds.length > 0) {
+      console.log(`Found ${invalidDriverIds.length} invalid FCM tokens, updating driver records`);
+      
+      const tokenUpdatePromises = invalidDriverIds.map(driverId => 
+        db.collection('drivers').doc(driverId).update({
+          fcmToken: admin.firestore.FieldValue.delete(),
+          tokenInvalid: true,
+          tokenUpdatedAt: admin.firestore.FieldValue.serverTimestamp()
+        })
+      );
+      
+      await Promise.all(tokenUpdatePromises);
+      console.log(`Updated driver records with invalid tokens`);
+    }
+    
+    const notifiedDriverIds = results
+      .filter(result => result.driverId !== null)
+      .map(result => result.driverId);
     
     if (notifiedDriverIds.length > 0) {
       await db.collection('requestNotifications').doc(requestId).update({
