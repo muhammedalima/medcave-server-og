@@ -33,7 +33,6 @@ function getServerIpAddresses() {
   Object.keys(networkInterfaces).forEach(interfaceName => {
     const interfaces = networkInterfaces[interfaceName];
     interfaces.forEach(iface => {
-      // Skip internal/loopback interfaces
       if (!iface.internal) {
         addresses.push({
           interface: interfaceName,
@@ -63,7 +62,7 @@ const INITIAL_RADIUS_KM = 10;
 const MAX_RADIUS_KM = 30;
 const RADIUS_INCREMENT_KM = 10;
 const NOTIFICATION_TIMEOUT_MINUTES = 5;
-const BASE_URL = 'medcave://ambulance'; // Changed to match app name in Flutter code
+const BASE_URL = 'yourapp://ambulance';
 
 // Function to calculate distance between two coordinates (Haversine formula)
 function calculateDistance(lat1, lon1, lat2, lon2) {
@@ -84,17 +83,8 @@ function toRadians(degrees) {
   return degrees * (Math.PI / 180);
 }
 
-/**
- * Generate a deep link URL for the Flutter app
- * @param {string} requestId - The ambulance request ID
- * @param {Object} extraParams - Additional URL parameters
- * @returns {string} - Complete URL for deep linking
- */
 function generateDeepLink(requestId, extraParams = {}) {
-  // Start with the base URL and add the requestId path
   let url = `${BASE_URL}/request/${requestId}`;
-  
-  // Add query parameters if any exist
   if (Object.keys(extraParams).length > 0) {
     const queryParams = new URLSearchParams();
     for (const [key, value] of Object.entries(extraParams)) {
@@ -102,22 +92,18 @@ function generateDeepLink(requestId, extraParams = {}) {
     }
     url = `${url}?${queryParams.toString()}`;
   }
-  
   console.log(`Generated deep link URL: ${url}`);
   return url;
 }
 
-// Handle new ambulance request notifications
 async function handleNewAmbulanceRequest(requestId, emergencyData, locationData) {
   try {
     console.log(`Processing new ambulance request: ${requestId}`);
     
-    // Start with initial radius
     let currentRadius = INITIAL_RADIUS_KM;
     let driversNotified = [];
     let requestAccepted = false;
     
-    // Store the request notification state in Firestore
     await db.collection('requestNotifications').doc(requestId).set({
       requestId,
       currentRadius,
@@ -130,7 +116,6 @@ async function handleNewAmbulanceRequest(requestId, emergencyData, locationData)
       )
     });
     
-    // Initial notification to drivers within radius
     await notifyDriversInRadius(requestId, locationData.latitude, locationData.longitude, currentRadius);
     
     console.log(`Initial notification sent for request: ${requestId} with ${currentRadius}km radius`);
@@ -143,6 +128,15 @@ async function notifyDriversInRadius(requestId, latitude, longitude, radiusKm) {
   try {
     console.log(`Finding drivers within ${radiusKm}km of location: ${latitude}, ${longitude}`);
     
+    // Get the request to access the userId
+    const requestDoc = await db.collection('ambulanceRequests').doc(requestId).get();
+    if (!requestDoc.exists) {
+      console.error(`Request ${requestId} not found`);
+      return [];
+    }
+    const requestData = requestDoc.data();
+    const requestUserId = requestData.userId;
+
     // Get all active drivers
     const driversSnapshot = await db.collection('drivers')
       .where('isDriverActive', '==', true)
@@ -153,7 +147,6 @@ async function notifyDriversInRadius(requestId, latitude, longitude, radiusKm) {
       return [];
     }
     
-    // Get the notification state
     const notificationDoc = await db.collection('requestNotifications').doc(requestId).get();
     if (!notificationDoc.exists) {
       console.error(`Notification state for request ${requestId} not found`);
@@ -163,7 +156,6 @@ async function notifyDriversInRadius(requestId, latitude, longitude, radiusKm) {
     const notificationState = notificationDoc.data();
     const previouslyNotifiedDrivers = notificationState.driversNotified || [];
     
-    // Filter drivers by distance and not previously notified
     const eligibleDrivers = [];
     
     driversSnapshot.forEach(doc => {
@@ -175,7 +167,12 @@ async function notifyDriversInRadius(requestId, latitude, longitude, radiusKm) {
         return;
       }
       
-      // Skip if no location data
+      // Skip if this driver is the one who made the request
+      if (driverId === requestUserId) {
+        console.log(`Skipping driver ${driverId} as they are the requestor`);
+        return;
+      }
+      
       if (!driverData.location) {
         return;
       }
@@ -183,7 +180,6 @@ async function notifyDriversInRadius(requestId, latitude, longitude, radiusKm) {
       const driverLat = driverData.location.latitude;
       const driverLng = driverData.location.longitude;
       
-      // Calculate distance
       const distance = calculateDistance(
         latitude, 
         longitude, 
@@ -194,34 +190,20 @@ async function notifyDriversInRadius(requestId, latitude, longitude, radiusKm) {
       if (distance <= radiusKm) {
         eligibleDrivers.push({
           driverId,
-          distance: Math.round(distance * 10) / 10, // Round to 1 decimal place
-          fcmToken: driverData.fcmToken,
-          driverRef: doc.ref // Store reference to driver document for token updates
+          distance: Math.round(distance * 10) / 10,
+          fcmToken: driverData.fcmToken
         });
       }
     });
     
     console.log(`Found ${eligibleDrivers.length} eligible drivers within ${radiusKm}km`);
     
-    // Get the request details to include in notification
-    const requestDoc = await db.collection('ambulanceRequests').doc(requestId).get();
-    if (!requestDoc.exists) {
-      console.error(`Request ${requestId} not found`);
-      return [];
-    }
-    
-    const requestData = requestDoc.data();
-    
-    // Send notifications to eligible drivers
-    const invalidTokens = []; // Track invalid tokens to remove them
     const notificationPromises = eligibleDrivers.map(async (driver) => {
-      // Check if driver has a valid FCM token
       if (!driver.fcmToken) {
         console.log(`Driver ${driver.driverId} has no FCM token`);
         return null;
       }
       
-      // Create notification message
       const message = {
         token: driver.fcmToken,
         notification: {
@@ -235,7 +217,7 @@ async function notifyDriversInRadius(requestId, latitude, longitude, radiusKm) {
           emergencyType: requestData.emergency?.detailedReason || 'Emergency',
           latitude: latitude.toString(),
           longitude: longitude.toString(),
-          serverUrl: SERVER_URL // Include server URL in notification payload
+          serverUrl: SERVER_URL
         },
         android: {
           priority: 'high',
@@ -255,66 +237,28 @@ async function notifyDriversInRadius(requestId, latitude, longitude, radiusKm) {
       };
       
       try {
-        // Send the notification
         await admin.messaging().send(message);
         console.log(`Notification sent to driver ${driver.driverId}`);
         return driver.driverId;
       } catch (error) {
         console.error(`Error sending notification to driver ${driver.driverId}:`, error);
-        
-        // Check if token is invalid and mark for removal
-        if (error.code === 'messaging/registration-token-not-registered' || 
-            error.code === 'messaging/invalid-registration-token' ||
-            error.code === 'messaging/invalid-argument') {
-          console.log(`Invalid FCM token detected for driver ${driver.driverId}. Marking for removal.`);
-          invalidTokens.push({
-            driverId: driver.driverId,
-            driverRef: driver.driverRef
-          });
-        }
-        
         return null;
       }
     });
     
-    // Wait for all notifications to be sent
     const notifiedDriverIds = (await Promise.all(notificationPromises))
-      .filter(id => id !== null); // Filter out null values
-    
-    // Process any invalid tokens that were detected
-    if (invalidTokens.length > 0) {
-      const tokenCleanupPromises = invalidTokens.map(async ({driverRef}) => {
-        try {
-          // Update the driver document to clear the invalid token
-          await driverRef.update({
-            fcmToken: admin.firestore.FieldValue.delete(),
-            tokenInvalidatedAt: admin.firestore.FieldValue.serverTimestamp(),
-            isTokenValid: false
-          });
-        } catch (error) {
-          console.error(`Error removing invalid token:`, error);
-        }
-      });
-      
-      // Wait for all token cleanup operations to complete
-      await Promise.all(tokenCleanupPromises);
-      console.log(`Cleaned up ${invalidTokens.length} invalid FCM tokens`);
-    }
+      .filter(id => id !== null);
     
     if (notifiedDriverIds.length > 0) {
-      // Update the notification state with newly notified drivers
       await db.collection('requestNotifications').doc(requestId).update({
         driversNotified: admin.firestore.FieldValue.arrayUnion(...notifiedDriverIds),
         updatedAt: admin.firestore.FieldValue.serverTimestamp(),
-        lastNotificationRadius: radiusKm,
-        invalidTokensDetected: invalidTokens.length > 0
+        lastNotificationRadius: radiusKm
       });
     } else {
-      // Just update the timestamp and radius without modifying the drivers array
       await db.collection('requestNotifications').doc(requestId).update({
         updatedAt: admin.firestore.FieldValue.serverTimestamp(),
-        lastNotificationRadius: radiusKm,
-        invalidTokensDetected: invalidTokens.length > 0
+        lastNotificationRadius: radiusKm
       });
       console.log(`No drivers were successfully notified for request ${requestId}`);
     }
@@ -326,13 +270,11 @@ async function notifyDriversInRadius(requestId, latitude, longitude, radiusKm) {
   }
 }
 
-// Expand radius if no drivers accept the request
 async function expandRadiusIfNeeded() {
   try {
     console.log('Checking for requests needing radius expansion...');
     const now = admin.firestore.Timestamp.now();
     
-    // Find requests that need radius expansion
     const notificationsSnapshot = await db.collection('requestNotifications')
       .where('requestAccepted', '==', false)
       .where('nextNotificationTime', '<=', now)
@@ -345,12 +287,10 @@ async function expandRadiusIfNeeded() {
     
     console.log(`Found ${notificationsSnapshot.size} requests needing radius expansion`);
     
-    // Process each notification
     const promises = notificationsSnapshot.docs.map(async (doc) => {
       const notificationData = doc.data();
       const requestId = notificationData.requestId;
       
-      // Check if the request is still pending
       const requestDoc = await db.collection('ambulanceRequests').doc(requestId).get();
       if (!requestDoc.exists) {
         console.log(`Request ${requestId} no longer exists, removing notification state`);
@@ -368,17 +308,14 @@ async function expandRadiusIfNeeded() {
         return;
       }
       
-      // Calculate new radius
       let newRadius = notificationData.currentRadius + RADIUS_INCREMENT_KM;
       if (newRadius > MAX_RADIUS_KM) {
         console.log(`Request ${requestId} has reached maximum radius (${MAX_RADIUS_KM}km)`);
-        // We could implement fallback logic here, like notifying admins or emergency services
         return;
       }
       
       console.log(`Expanding radius for request ${requestId} from ${notificationData.currentRadius}km to ${newRadius}km`);
       
-      // Notify drivers in the expanded radius
       await notifyDriversInRadius(
         requestId, 
         requestData.location.latitude, 
@@ -386,7 +323,6 @@ async function expandRadiusIfNeeded() {
         newRadius
       );
       
-      // Update notification state
       await doc.ref.update({
         currentRadius: newRadius,
         updatedAt: admin.firestore.FieldValue.serverTimestamp(),
@@ -403,58 +339,47 @@ async function expandRadiusIfNeeded() {
   }
 }
 
-// Setup cron job to check and expand radius every 5 minutes
 cron.schedule('*/5 * * * *', async () => {
   console.log('Running scheduled radius expansion check');
   await expandRadiusIfNeeded();
 });
 
-const authenticateJWT = async (req, res, next) => {
+app.post('/api/notify-drivers', async (req, res) => {
   try {
-    const authHeader = req.headers.authorization;
+    const { requestId } = req.body;
     
-    if (!authHeader || !authHeader.startsWith('Bearer ')) {
-      return res.status(401).json({ error: 'Unauthorized: No token provided' });
+    if (!requestId) {
+      return res.status(400).json({ error: 'Request ID is required' });
     }
     
-    const token = authHeader.split(' ')[1];
-    
-    // Verify the Firebase ID token
-    const decodedToken = await admin.auth().verifyIdToken(token);
-    req.user = decodedToken;
-    next();
-  } catch (error) {
-    console.error('Error verifying token:', error);
-    return res.status(403).json({ error: 'Forbidden: Invalid token' });
-  }
-};
-
-app.post('/api/update-fcm-token', authenticateJWT, async (req, res) => {
-  try {
-    const { fcmToken } = req.body;
-    const userId = req.user.uid;
-    
-    if (!fcmToken) {
-      return res.status(400).json({ error: 'FCM token is required' });
+    const requestDoc = await db.collection('ambulanceRequests').doc(requestId).get();
+    if (!requestDoc.exists) {
+      return res.status(404).json({ error: 'Ambulance request not found' });
     }
     
-    // Update the token in Firestore
-    await db.collection('drivers').doc(userId).update({
-      fcmToken: fcmToken,
-      tokenUpdatedAt: admin.firestore.FieldValue.serverTimestamp(),
-      isTokenValid: true
-    });
+    const requestData = requestDoc.data();
     
-    return res.json({ success: true, message: 'FCM token updated successfully' });
+    if (requestData.status !== 'pending') {
+      return res.status(400).json({ 
+        error: 'Request is not in pending state',
+        status: requestData.status
+      });
+    }
+    
+    await handleNewAmbulanceRequest(
+      requestId,
+      requestData.emergency,
+      requestData.location
+    );
+    
+    return res.json({ success: true, message: 'Notification process started' });
   } catch (error) {
-    console.error('Error updating FCM token:', error);
+    console.error('Error in notify-drivers endpoint:', error);
     return res.status(500).json({ error: 'Internal server error' });
   }
 });
 
-// Listen for new ambulance requests
 function setupFirestoreListeners() {
-  // Listen for new ambulance requests
   db.collection('ambulanceRequests')
     .where('status', '==', 'pending')
     .onSnapshot(snapshot => {
@@ -463,7 +388,6 @@ function setupFirestoreListeners() {
           const requestData = change.doc.data();
           const requestId = change.doc.id;
           
-          // Process the new request
           handleNewAmbulanceRequest(
             requestId, 
             requestData.emergency, 
@@ -475,7 +399,6 @@ function setupFirestoreListeners() {
       console.error('Error listening to ambulance requests:', error);
     });
     
-  // Listen for request status changes to update notification state
   db.collection('ambulanceRequests')
     .onSnapshot(snapshot => {
       snapshot.docChanges().forEach(async change => {
@@ -483,7 +406,6 @@ function setupFirestoreListeners() {
           const requestData = change.doc.data();
           const requestId = change.doc.id;
           
-          // If request was accepted, update the notification state
           if (requestData.status === 'accepted') {
             try {
               const notificationDoc = await db.collection('requestNotifications').doc(requestId).get();
@@ -506,24 +428,24 @@ function setupFirestoreListeners() {
     });
 }
 
-// Start server and listeners
 const PORT = process.env.PORT || 3000;
 const SERVER_HOST = process.env.SERVER_HOST || 'localhost';
 const NODE_ENV = process.env.NODE_ENV || 'development';
 
-// Get the base URL of the server - updated to match the API service in the client app
 const getServerUrl = () => {
   if (process.env.SERVER_URL) {
     return process.env.SERVER_URL;
   }
   
-  // Default to the same URL used in the Flutter app
+  const protocol = NODE_ENV === 'production' ? 'https' : 'http';
+  
   if (NODE_ENV === 'production') {
-    return 'https://medcave-server.onrender.com';
+    if (PORT === 80 || PORT === 443) {
+      return `${protocol}://${SERVER_HOST}`;
+    }
+    return `${protocol}://${SERVER_HOST}:${PORT}`;
   }
   
-  // For local development
-  const protocol = 'http';
   return `${protocol}://${SERVER_HOST}:${PORT}`;
 };
 
@@ -537,7 +459,6 @@ app.listen(PORT, () => {
   console.log('Firestore listeners established');
 });
 
-// Get server URL endpoint
 app.get('/api/server-info', (req, res) => {
   const serverInfo = {
     url: SERVER_URL,
@@ -553,9 +474,6 @@ app.get('/api/server-info', (req, res) => {
   return res.json(serverInfo);
 });
 
-// Additional helper routes
-
-// Endpoint to get notification status for a request
 app.get('/api/notification-status/:requestId', async (req, res) => {
   try {
     const { requestId } = req.params;
@@ -572,7 +490,6 @@ app.get('/api/notification-status/:requestId', async (req, res) => {
   }
 });
 
-// Endpoint to manually expand radius
 app.post('/api/expand-radius/:requestId', async (req, res) => {
   try {
     const { requestId } = req.params;
@@ -584,7 +501,6 @@ app.post('/api/expand-radius/:requestId', async (req, res) => {
     
     const notificationData = notificationDoc.data();
     
-    // Get request details
     const requestDoc = await db.collection('ambulanceRequests').doc(requestId).get();
     if (!requestDoc.exists) {
       return res.status(404).json({ error: 'Ambulance request not found' });
@@ -592,13 +508,11 @@ app.post('/api/expand-radius/:requestId', async (req, res) => {
     
     const requestData = requestDoc.data();
     
-    // Calculate new radius
     let newRadius = notificationData.currentRadius + RADIUS_INCREMENT_KM;
     if (newRadius > MAX_RADIUS_KM) {
       newRadius = MAX_RADIUS_KM;
     }
     
-    // Notify drivers in the expanded radius
     await notifyDriversInRadius(
       requestId, 
       requestData.location.latitude, 
@@ -606,7 +520,6 @@ app.post('/api/expand-radius/:requestId', async (req, res) => {
       newRadius
     );
     
-    // Update notification state
     await notificationDoc.ref.update({
       currentRadius: newRadius,
       updatedAt: admin.firestore.FieldValue.serverTimestamp(),
@@ -626,7 +539,6 @@ app.post('/api/expand-radius/:requestId', async (req, res) => {
   }
 });
 
-// Add an endpoint to update or configure the base URL for deep links
 app.post('/api/config/deep-link', async (req, res) => {
   try {
     const { baseUrl } = req.body;
@@ -635,8 +547,6 @@ app.post('/api/config/deep-link', async (req, res) => {
       return res.status(400).json({ error: 'Base URL is required' });
     }
     
-    // For a real implementation, you would store this in a config database
-    // Here we'll just respond with success (this is just an example)
     return res.json({ 
       success: true, 
       message: 'Deep link base URL configured',
@@ -647,10 +557,5 @@ app.post('/api/config/deep-link', async (req, res) => {
     return res.status(500).json({ error: 'Internal server error' });
   }
 });
-
-// Apply authentication middleware to protected routes
-app.post('/api/notify-drivers', authenticateJWT);
-app.get('/api/notification-status/:requestId', authenticateJWT);
-app.post('/api/expand-radius/:requestId', authenticateJWT);
 
 export default app;
